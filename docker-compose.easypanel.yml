@@ -1,0 +1,537 @@
+# QuantDinger Docker Compose - Easypanel & Cloud Stack
+#
+# Production configuration optimized for Easypanel, Coolify, Portainer, or standalone Docker.
+# Uses prebuilt multi-arch GHCR images to eliminate build timeouts on VPS servers.
+#
+# Key Features:
+# - Zero host-file dependencies (no fragile ./.env bind mount issues)
+# - Internal isolation: PostgreSQL, Redis, and Kafka do not collide with host ports
+# - Web frontend on port 8888 (routes to :80 internally)
+# - Mobile H5 on port 8889 (routes to :80 internally)
+# - Unified named volumes for persistence
+
+x-backend-runtime: &backend-runtime
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: ${BACKEND_PIDS_LIMIT:-512}
+  stop_grace_period: ${BACKEND_STOP_GRACE_PERIOD:-45s}
+  logging:
+    driver: json-file
+    options:
+      max-size: ${CONTAINER_LOG_MAX_SIZE:-20m}
+      max-file: ${CONTAINER_LOG_MAX_FILES:-5}
+
+x-backend-env: &backend-env
+  TZ: ${TZ:-UTC}
+  DATABASE_URL: postgresql://${POSTGRES_USER:-quantdinger}:${POSTGRES_PASSWORD:-quantdinger123}@postgres:5432/${POSTGRES_DB:-quantdinger}
+  DB_TYPE: postgresql
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+  REDIS_CACHE_NAMESPACE: ${REDIS_CACHE_NAMESPACE:-quantdinger:cache:v1}
+  CACHE_ENABLED: "true"
+  CELERY_TASKS_ENABLED: "true"
+  CELERY_REDIS_HOST: redis-jobs
+  CELERY_REDIS_PORT: "6379"
+  CELERY_REDIS_PASSWORD: ${CELERY_REDIS_PASSWORD:-}
+  CELERY_BROKER_DB: "0"
+  CELERY_RESULT_DB: "1"
+  CELERY_BROKER_URL: ${CELERY_BROKER_URL:-}
+  CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-}
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  SKIP_AUTO_MIGRATE: "true"
+  LOG_FORMAT: ${LOG_FORMAT:-json}
+  SECRET_KEY: ${SECRET_KEY:-}
+  CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY:-}
+  ADMIN_USER: ${ADMIN_USER:-admin}
+  ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123456}
+  ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@quantdinger.local}
+  FRONTEND_URL: ${FRONTEND_URL:-http://localhost:8888,http://localhost:8889}
+  ALLOW_LOCAL_DESKTOP_BROKERS: ${ALLOW_LOCAL_DESKTOP_BROKERS:-false}
+  LLM_PROVIDER: ${LLM_PROVIDER:-openrouter}
+  OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+  OPENROUTER_MODEL: ${OPENROUTER_MODEL:-nvidia/nemotron-3.5-lightning:free}
+  DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+  DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:18.3-alpine}
+    container_name: quantdinger-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-quantdinger}
+      POSTGRES_USER: ${POSTGRES_USER:-quantdinger}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quantdinger123}
+      PGDATA: /var/lib/postgresql/18/docker
+      TZ: ${TZ:-UTC}
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=${PG_MAX_CONNECTIONS:-150}"
+      - "-c"
+      - "shared_buffers=${PG_SHARED_BUFFERS:-256MB}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/18/docker
+    networks:
+      - quantdinger-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-quantdinger} -d ${POSTGRES_DB:-quantdinger}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:8-alpine}
+    container_name: quantdinger-redis
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    command:
+      - sh
+      - -ec
+      - |
+        if [ -n "$$REDIS_PASSWORD" ]; then set -- --requirepass "$$REDIS_PASSWORD"; fi
+        exec redis-server --maxmemory "${REDIS_CACHE_MAXMEMORY:-128mb}" --maxmemory-policy allkeys-lru "$$@"
+    networks:
+      - quantdinger-network
+    healthcheck:
+      test: ["CMD-SHELL", "if [ -n \"$$REDIS_PASSWORD\" ]; then redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping; else redis-cli ping; fi"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis-jobs:
+    image: ${REDIS_IMAGE:-redis:8-alpine}
+    container_name: quantdinger-redis-jobs
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${CELERY_REDIS_PASSWORD:-}
+    command:
+      - sh
+      - -ec
+      - |
+        if [ -n "$$REDIS_PASSWORD" ]; then set -- --requirepass "$$REDIS_PASSWORD"; fi
+        exec redis-server --appendonly yes --appendfsync everysec --save 60 1000 --maxmemory "${REDIS_JOBS_MAXMEMORY:-512mb}" --maxmemory-policy noeviction "$$@"
+    volumes:
+      - celery_redis_data:/data
+    networks:
+      - quantdinger-network
+    healthcheck:
+      test: ["CMD-SHELL", "if [ -n \"$$REDIS_PASSWORD\" ]; then redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping; else redis-cli ping; fi"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: ${KAFKA_IMAGE:-apache/kafka:4.3.1}
+    container_name: quantdinger-kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: CONTROLLER://:9093,PLAINTEXT://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - quantdinger-network
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  kafka-init:
+    <<: *backend-runtime
+    image: ${BACKEND_IMAGE:-ghcr.io/openbyteinc/quantdinger-backend}:${IMAGE_TAG:-latest}
+    pull_policy: always
+    container_name: quantdinger-kafka-init
+    restart: "no"
+    command: ["python", "-m", "app.commands.kafka_topics"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - backend_logs:/app/logs
+      - backend_data:/app/data
+    environment:
+      <<: *backend-env
+      KAFKA_REPLICATION_FACTOR: ${KAFKA_REPLICATION_FACTOR:-1}
+      KAFKA_MARKET_PARTITIONS: ${KAFKA_MARKET_PARTITIONS:-48}
+      KAFKA_STRATEGY_PARTITIONS: ${KAFKA_STRATEGY_PARTITIONS:-128}
+      KAFKA_ORDER_PARTITIONS: ${KAFKA_ORDER_PARTITIONS:-96}
+      KAFKA_DLQ_PARTITIONS: ${KAFKA_DLQ_PARTITIONS:-24}
+    networks:
+      - quantdinger-network
+
+  migration:
+    <<: *backend-runtime
+    image: ${BACKEND_IMAGE:-ghcr.io/openbyteinc/quantdinger-backend}:${IMAGE_TAG:-latest}
+    pull_policy: always
+    container_name: quantdinger-migration
+    restart: "no"
+    command: ["python", "-m", "app.commands.migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - backend_logs:/app/logs
+      - backend_data:/app/data
+    environment:
+      <<: *backend-env
+      DB_POOL_MIN: "1"
+      DB_POOL_MAX: "2"
+      DB_APPLICATION_NAME: quantdinger-migration
+    networks:
+      - quantdinger-network
+
+  backend:
+    <<: *backend-runtime
+    image: ${BACKEND_IMAGE:-ghcr.io/openbyteinc/quantdinger-backend}:${IMAGE_TAG:-latest}
+    pull_policy: always
+    container_name: quantdinger-backend
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-jobs:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+    ports:
+      - "${BACKEND_PORT:-5000}:5000"
+    volumes:
+      - backend_logs:/app/logs
+      - backend_data:/app/data
+    environment:
+      <<: *backend-env
+      PYTHON_API_HOST: 0.0.0.0
+      PYTHON_API_PORT: "5000"
+      QD_PROCESS_ROLE: api
+      PROMETHEUS_MULTIPROC_DIR: /tmp/quantdinger-prometheus
+      STRATEGY_COMMANDS_ENABLED: "true"
+      DB_POOL_MIN: ${DB_POOL_MIN:-2}
+      DB_POOL_MAX: ${DB_POOL_MAX:-12}
+      DB_POOL_ACQUIRE_TIMEOUT: ${DB_POOL_ACQUIRE_TIMEOUT:-10}
+      DB_POOL_HEALTH_CHECK: "true"
+      DB_APPLICATION_NAME: quantdinger-api
+      MARKET_EXECUTOR_WORKERS: ${MARKET_EXECUTOR_WORKERS:-6}
+      PORTFOLIO_EXECUTOR_WORKERS: ${PORTFOLIO_EXECUTOR_WORKERS:-3}
+      RESOURCE_FD_COOLDOWN_SEC: ${RESOURCE_FD_COOLDOWN_SEC:-180}
+      PORTFOLIO_MONITOR_DUE_BATCH_LIMIT: ${PORTFOLIO_MONITOR_DUE_BATCH_LIMIT:-5}
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-2}
+      GUNICORN_THREADS: ${GUNICORN_THREADS:-4}
+    networks:
+      - quantdinger-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  trading-worker:
+    <<: *backend-runtime
+    image: ${BACKEND_IMAGE:-ghcr.io/openbyteinc/quantdinger-backend}:${IMAGE_TAG:-latest}
+    pull_policy: always
+    container_name: quantdinger-trading-worker
+    restart: unless-stopped
+    command: ["python", "-m", "app.commands.trading_worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+    volumes:
+      - backend_logs:/app/logs
+      - backend_data:/app/data
+    environment:
+      <<: *backend-env
+      QD_PROCESS_ROLE: trading
+      STRATEGY_COMMANDS_ENABLED: "false"
+      DB_POOL_MIN: ${TRADING_DB_POOL_MIN:-4}
+      DB_POOL_MAX: ${TRADING_DB_POOL_MAX:-32}
+      DB_APPLICATION_NAME: quantdinger-trading
+      KAFKA_CLIENT_ID: quantdinger-trading
+    networks:
+      - quantdinger-network
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.commands.worker_health", "trading"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  kafka-audit-worker:
+    <<: *backend-runtime
+    image: ${BACKEND_IMAGE:-ghcr.io/openbyteinc/quantdinger-backend}:${IMAGE_TAG:-latest}
+    pull_policy: always
+    container_name: quantdinger-kafka-audit-worker
+    restart: unless-stopped
+    command: ["python", "-m", "app.commands.kafka_audit_worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+    volumes:
+      - backend_logs:/app/logs
+      - backend_data:/app/data
+    environment:
+      <<: *backend-env
+      QD_PROCESS_ROLE: kafka-audit
+      DB_POOL_MIN: "1"
+      DB_POOL_MAX: "3"
+      DB_APPLICATION_NAME: quantdinger-kafka-audit
+      KAFKA_AUDIT_GROUP_ID: quantdinger-runtime-audit-v1
+    networks:
+      - quantdinger-network
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.commands.worker_health", "kafka-audit"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  strategy-dispatcher-worker:
+    <<: *backend-runtime
+    image: ${BACKEND_IMAGE:-ghcr.io/openbyteinc/quantdinger-backend}:${IMAGE_TAG:-latest}
+    pull_policy: always
+    container_name: quantdinger-strategy-dispatcher-worker
+    restart: unless-stopped
+    command: ["python", "-m", "app.commands.strategy_dispatcher_worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+    volumes:
+      - backend_logs:/app/logs
+      - backend_data:/app/data
+    environment:
+      <<: *backend-env
+      QD_PROCESS_ROLE: strategy-dispatcher
+      DB_POOL_MIN: "1"
+      DB_POOL_MAX: "4"
+      DB_APPLICATION_NAME: quantdinger-strategy-dispatcher
+      KAFKA_CLIENT_ID: quantdinger-strategy-dispatcher
+      KAFKA_STRATEGY_DISPATCH_GROUP_ID: quantdinger-strategy-dispatch-v1
+    networks:
+      - quantdinger-network
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.commands.worker_health", "strategy-dispatcher"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  strategy-evaluator-worker:
+    <<: *backend-runtime
+    image: ${BACKEND_IMAGE:-ghcr.io/openbyteinc/quantdinger-backend}:${IMAGE_TAG:-latest}
+    pull_policy: always
+    container_name: quantdinger-strategy-evaluator-worker
+    restart: unless-stopped
+    command: ["python", "-m", "app.commands.strategy_evaluator_worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+    volumes:
+      - backend_logs:/app/logs
+      - backend_data:/app/data
+    environment:
+      <<: *backend-env
+      QD_PROCESS_ROLE: strategy-evaluator
+      DB_POOL_MIN: "1"
+      DB_POOL_MAX: "4"
+      DB_APPLICATION_NAME: quantdinger-strategy-evaluator
+      KAFKA_CLIENT_ID: quantdinger-strategy-evaluator
+      KAFKA_STRATEGY_EVALUATOR_GROUP_ID: ${KAFKA_STRATEGY_EVALUATOR_GROUP_ID:-quantdinger-strategy-evaluator-active-v1}
+    networks:
+      - quantdinger-network
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.commands.worker_health", "strategy-evaluator"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  scheduler-worker:
+    <<: *backend-runtime
+    image: ${BACKEND_IMAGE:-ghcr.io/openbyteinc/quantdinger-backend}:${IMAGE_TAG:-latest}
+    pull_policy: always
+    container_name: quantdinger-scheduler-worker
+    restart: unless-stopped
+    command: ["python", "-m", "app.commands.scheduler"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+    volumes:
+      - backend_logs:/app/logs
+      - backend_data:/app/data
+    environment:
+      <<: *backend-env
+      QD_PROCESS_ROLE: scheduler
+      DB_POOL_MIN: ${WORKER_DB_POOL_MIN:-2}
+      DB_POOL_MAX: ${WORKER_DB_POOL_MAX:-12}
+      DB_APPLICATION_NAME: quantdinger-scheduler
+    networks:
+      - quantdinger-network
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.commands.worker_health", "scheduler"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  celery-worker:
+    <<: *backend-runtime
+    image: ${BACKEND_IMAGE:-ghcr.io/openbyteinc/quantdinger-backend}:${IMAGE_TAG:-latest}
+    pull_policy: always
+    container_name: quantdinger-celery-worker
+    restart: unless-stopped
+    command: ["celery", "-A", "app.celery_app:celery_app", "worker", "--loglevel=INFO", "-Q", "jobs,ai,maintenance", "--concurrency=${CELERY_CONCURRENCY:-2}"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis-jobs:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+    volumes:
+      - backend_logs:/app/logs
+      - backend_data:/app/data
+    environment:
+      <<: *backend-env
+      QD_PROCESS_ROLE: celery
+      DB_POOL_MIN: ${WORKER_DB_POOL_MIN:-2}
+      DB_POOL_MAX: ${WORKER_DB_POOL_MAX:-12}
+      DB_APPLICATION_NAME: quantdinger-celery-worker
+    networks:
+      - quantdinger-network
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.commands.worker_health", "celery"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+
+  celery-beat:
+    <<: *backend-runtime
+    image: ${BACKEND_IMAGE:-ghcr.io/openbyteinc/quantdinger-backend}:${IMAGE_TAG:-latest}
+    pull_policy: always
+    container_name: quantdinger-celery-beat
+    restart: unless-stopped
+    command: ["celery", "-A", "app.celery_app:celery_app", "beat", "--loglevel=INFO", "--schedule=/app/data/celerybeat-schedule"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis-jobs:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+    volumes:
+      - backend_logs:/app/logs
+      - backend_data:/app/data
+    environment:
+      <<: *backend-env
+      QD_PROCESS_ROLE: celery
+      DB_POOL_MIN: ${WORKER_DB_POOL_MIN:-2}
+      DB_POOL_MAX: ${WORKER_DB_POOL_MAX:-12}
+      DB_APPLICATION_NAME: quantdinger-celery-beat
+    networks:
+      - quantdinger-network
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  frontend:
+    image: ${FRONTEND_IMAGE:-ghcr.io/openbyteinc/quantdinger-frontend}:${IMAGE_TAG:-latest}
+    pull_policy: always
+    container_name: quantdinger-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-8888}:80"
+    environment:
+      BACKEND_URL: http://backend:5000
+    depends_on:
+      - backend
+    networks:
+      - quantdinger-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  mobile:
+    image: ${MOBILE_IMAGE:-ghcr.io/openbyteinc/quantdinger-mobile}:${IMAGE_TAG:-latest}
+    pull_policy: always
+    container_name: quantdinger-mobile
+    restart: unless-stopped
+    ports:
+      - "${MOBILE_PORT:-8889}:80"
+    environment:
+      BACKEND_URL: http://backend:5000
+    depends_on:
+      - backend
+    networks:
+      - quantdinger-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  postgres_data:
+    driver: local
+  backend_logs:
+    driver: local
+  backend_data:
+    driver: local
+  celery_redis_data:
+    driver: local
+  kafka_data:
+    driver: local
+
+networks:
+  quantdinger-network:
+    driver: bridge
