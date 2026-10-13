@@ -118,7 +118,10 @@ def _parse_database_url(url: str) -> Dict[str, Any]:
     
     # Split host:port/dbname
     if '/' in hostpart:
-        hostport, result['dbname'] = hostpart.split('/', 1)
+        hostport, dbname = hostpart.split('/', 1)
+        if '?' in dbname:
+            dbname = dbname.split('?', 1)[0]
+        result['dbname'] = dbname
     else:
         hostport = hostpart
     
